@@ -19,7 +19,7 @@ import android.os.Looper
  * absolute VolumeProvider (0..100) whose callbacks feed [CastEngine]'s
  * volume. Inactive whenever nothing is casting, so the buttons control
  * the phone again as soon as the cast stops. (Same mechanism Outro
- * uses; AirMusic doesn't do this.)
+ * uses.)
  */
 object VolumeKeys {
     private val main = Handler(Looper.getMainLooper())
