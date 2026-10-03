@@ -26,12 +26,19 @@ Apps like AirMusic made Android-to-speaker casting popular, but:
 
 ## Features
 
-- One-tap casting to discovered AirPlay speakers (NSD, `_raop._tcp` +
-  `_airplay._tcp`), or connect by IP
+- One-tap casting to discovered speakers (AirPlay NSD, DLNA/Sonos SSDP,
+  Chromecast), or connect by IP
 - Streams **all device audio** via Android's AudioPlaybackCapture API
-  (Android 10+; no root)
+  (Android 10+; no root) — or only the apps you pick (per-app capture)
 - True AirPlay 2: transient HAP pairing (SRP), ChaCha20-Poly1305 channels,
-  ALAC audio at 44.1 kHz, NTP timing + sync, retransmit handling
+  ALAC audio at 44.1 kHz, NTP timing + sync, retransmit handling — with a
+  classic AirPlay 1 / RAOP fallback for older receivers
+- **Multi-speaker**: cast to several speakers at once; each speaker has
+  its **own volume slider** and remembers its level
+- **DLNA / Sonos and Chromecast** via the built-in local stream server
+- **5-band EQ + preamp** with presets, applied live
+- **Now playing**: title, artist, album and artwork sent to the speaker
+- Sleep timer, silence auto-stop, Quick Settings tile, reconnect card
 - Foreground service with notification controls — keeps casting with the
   screen off; Stop from the notification
 - Speaker volume from the app slider **and** the hardware buttons
@@ -44,14 +51,8 @@ Apps like AirMusic made Android-to-speaker casting popular, but:
   captured; those stay silent. Voice-call audio is never captured.
 - AirPlay buffers about a second or two of audio, so there's a delay —
   perfect for music and podcasts, not for lip-syncing video.
-- One speaker at a time in v1.0.
-
-## Roadmap
-
-- Multi-room / multiple speakers at once
-- AirPlay 1 (classic RAOP) fallback for older receivers
-- Now-playing metadata + artwork to the speaker
-- Quick Settings tile and home-screen widget
+- Multi-speaker playback is near-synchronized (one shared capture,
+  independent per-speaker pacing), not sample-exact.
 
 ## Requirements
 
