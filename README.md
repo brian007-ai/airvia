@@ -10,7 +10,7 @@ Free and open source. No trial, no added noise, no account, no ads.
 
 ## Why Airvia?
 
-Apps like AirMusic made Android-to-speaker casting popular, but:
+Android-to-speaker casting apps have been around for years, but:
 
 - **AirPlay 2 is the headline.** Airvia speaks the actual AirPlay 2 protocol
   (HAP transient pairing, encrypted channels, buffered ALAC audio) — the same
