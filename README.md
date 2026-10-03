@@ -1,0 +1,88 @@
+# Airvia
+
+**Stream all your Android audio to AirPlay 2 speakers — HomePod included.**
+
+Airvia captures your phone's audio output (Spotify, YouTube Music, podcasts,
+radio, almost any app) and sends it to your speakers over **real AirPlay 2**,
+with the modern transient-pairing handshake current HomePods require.
+
+Free and open source. No trial, no added noise, no account, no ads.
+
+## Why Airvia?
+
+Apps like AirMusic made Android-to-speaker casting popular, but:
+
+- **AirPlay 2 is the headline.** Airvia speaks the actual AirPlay 2 protocol
+  (HAP transient pairing, encrypted channels, buffered ALAC audio) — the same
+  sender stack that was verified packet-by-packet against pyatv and owntone
+  and confirmed playing on a real HomePod mini.
+- **Your volume buttons control the speaker — everywhere.** While casting,
+  the side buttons adjust the *speaker's* volume, even from the lock screen
+  or inside other apps (a dedicated remote-volume media session handles it).
+  When the cast stops, the buttons are the phone's again.
+- **You can see what's happening.** A live connection log (copy/share built
+  in) shows the full pairing and streaming conversation — no black box.
+- **It's free.** No 10-minute trial noise, no paywall.
+
+## Features
+
+- One-tap casting to discovered AirPlay speakers (NSD, `_raop._tcp` +
+  `_airplay._tcp`), or connect by IP
+- Streams **all device audio** via Android's AudioPlaybackCapture API
+  (Android 10+; no root)
+- True AirPlay 2: transient HAP pairing (SRP), ChaCha20-Poly1305 channels,
+  ALAC audio at 44.1 kHz, NTP timing + sync, retransmit handling
+- Foreground service with notification controls — keeps casting with the
+  screen off; Stop from the notification
+- Speaker volume from the app slider **and** the hardware buttons
+  (foreground, background, lock screen)
+- Live diagnostics log with copy/share
+
+## Honest limits (Android platform rules — every caster has them)
+
+- Apps can opt out of playback capture, and DRM-protected output is never
+  captured; those stay silent. Voice-call audio is never captured.
+- AirPlay buffers about a second or two of audio, so there's a delay —
+  perfect for music and podcasts, not for lip-syncing video.
+- One speaker at a time in v1.0.
+
+## Roadmap
+
+- Multi-room / multiple speakers at once
+- AirPlay 1 (classic RAOP) fallback for older receivers
+- Now-playing metadata + artwork to the speaker
+- Quick Settings tile and home-screen widget
+
+## Requirements
+
+- Android 10 (API 29) or newer
+- Speaker and phone on the same Wi-Fi network
+
+## Building
+
+No Gradle — a single shell script (JDK 17 + Android SDK 34 +
+kotlin-compiler-embeddable 2.1.0):
+
+```sh
+./build.sh
+```
+
+JVM self-tests for the crypto/protocol stack and the 48→44.1 kHz
+resampler live in `tests/` and run on any JVM.
+
+## How it works
+
+1. `AudioPlaybackCapture` (with the per-session consent Android requires)
+   taps the playback mix at 48 kHz.
+2. A streaming resampler converts to 44.1 kHz; a ring buffer absorbs jitter.
+3. The AirPlay 2 sender pairs transiently (no PIN, no stored keys), opens
+   the encrypted control/event channels, and streams ALAC-framed PCM with
+   timing sync packets sent from the advertised control socket — the detail
+   that makes a HomePod actually schedule playout.
+
+Protocol behaviour was cross-checked against the open-source references
+[pyatv](https://pyatv.dev) and [owntone](https://owntone.github.io/owntone-server/).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
