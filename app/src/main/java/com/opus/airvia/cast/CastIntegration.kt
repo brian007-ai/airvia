@@ -3,6 +3,7 @@ package com.opus.airvia.cast
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import androidx.mediarouter.media.MediaRouteSelector
 import androidx.mediarouter.media.MediaRouter
 import com.google.android.gms.cast.MediaInfo
 import com.google.android.gms.cast.MediaLoadRequestData
@@ -67,10 +68,29 @@ object CastIntegration {
     // ------------------------------------------------------------------
 
     private fun discoverRoutes(app: Context, timeoutMs: Long): List<Speaker> {
-        val castContext = CastContext.getSharedInstance(app)
-        val selector = castContext.mergedSelector
+        val main = Handler(Looper.getMainLooper())
+        // CastContext.getSharedInstance() (and the MediaRouter singleton)
+        // are main-thread-only APIs — acquiring them on the scan thread
+        // threw "Must be called from the main thread" and discovery
+        // silently returned nothing. Acquire both on main, then run the
+        // same callback-based scan as before.
+        val selectorRef = AtomicReference<MediaRouteSelector?>()
+        val routerRef = AtomicReference<MediaRouter?>()
+        val acquireError = AtomicReference<Throwable?>()
+        runOnMainSync(main) {
+            try {
+                val castContext = CastContext.getSharedInstance(app)
+                selectorRef.set(castContext.mergedSelector)
+                routerRef.set(MediaRouter.getInstance(app))
+            } catch (t: Throwable) {
+                acquireError.set(t)
+            }
+        }
+        acquireError.get()?.let { throw it }
+        val selector = selectorRef.get()
             ?: throw IllegalStateException("Cast selector unavailable")
-        val mediaRouter = MediaRouter.getInstance(app)
+        val mediaRouter = routerRef.get()
+            ?: throw IllegalStateException("MediaRouter unavailable")
         val found = linkedMapOf<String, Speaker>()
         val callback = object : MediaRouter.Callback() {
             override fun onRouteAdded(router: MediaRouter, route: MediaRouter.RouteInfo) {
@@ -101,7 +121,6 @@ object CastIntegration {
                 }
             }
         }
-        val main = Handler(Looper.getMainLooper())
         runOnMainSync(main) {
             mediaRouter.addCallback(
                 selector, callback,
