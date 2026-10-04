@@ -70,14 +70,48 @@ class Ap2AudioSession(
     @Volatile
     private var volumeDb: Float = 0.0f
 
+    /** Set by [setVolumeDb]; consumed by the streaming thread. */
+    private val volumeDirty = AtomicBoolean(false)
+
+    /** Set by [setMetadata]; consumed by the streaming thread. */
+    private val metadataDirty = AtomicBoolean(false)
+
     @Volatile
     private var streamReady = false
 
-    /** Set the receiver volume in dB (0 = max, -30 = min, -144 = mute). */
+    /**
+     * Set the receiver volume in dB (0 = max, -30 = min, -144 = mute).
+     *
+     * NON-BLOCKING since 1.2.1: this only records the level. The
+     * streaming thread — the control channel's sole owner — transmits
+     * it within ~200 ms, coalescing bursts (a slider drag becomes one
+     * request with the latest value).
+     *
+     * Before, this did a synchronous RTSP exchange on the CALLER's
+     * thread, which for every volume path (in-app slider, foreground
+     * keys, VolumeProvider callbacks) is the main thread: each change
+     * blocked the UI for a full network round trip (socket timeout
+     * 12 s), changes queued up on [rtspLock], and a single read that
+     * timed out mid-frame permanently desynced the HAP channel
+     * ([Ap2Channel] consumes frame bytes incrementally but only
+     * advances its nonce counter after a full frame decrypts), so
+     * /feedback could never be delivered again and the receiver tore
+     * the session down — "changing the volume stops the speaker".
+     */
     fun setVolumeDb(db: Float) {
         volumeDb = db
-        if (!streamReady) return
-        try {
+        volumeDirty.set(true)
+    }
+
+    /**
+     * Streaming-thread only: transmit a queued volume change.
+     * Returns false when the exchange itself failed (no response) —
+     * the caller counts consecutive control-channel failures.
+     */
+    private fun flushVolumeNow(): Boolean {
+        val db = volumeDb
+        volumeDirty.set(false)
+        return try {
             val resp = rtsp(
                 "SET_PARAMETER", rtspUri,
                 "volume: ${"%.6f".format(java.util.Locale.US, db)}"
@@ -85,8 +119,10 @@ class Ap2AudioSession(
                 "text/parameters",
             )
             LogBus.log("[$TAG] SET_PARAMETER volume $db -> ${resp.status}")
+            true
         } catch (e: Exception) {
             LogBus.log("[$TAG] SET_PARAMETER volume failed: ${e.message}")
+            false
         }
     }
 
@@ -99,19 +135,26 @@ class Ap2AudioSession(
 
     /**
      * Push now-playing metadata (DMAP) + artwork (JPEG) to the receiver.
-     * Strictly best-effort: failures are logged, never thrown, and the
-     * stream is never delayed by them.
+     * Non-blocking since 1.2.1 (see [setVolumeDb]): this only records
+     * the values; the streaming thread transmits them. Strictly
+     * best-effort — failures are logged, never thrown, and the stream
+     * is never delayed by them.
      */
     fun setMetadata(title: String, artist: String, album: String, artworkJpeg: ByteArray?) {
         pendingMetadata = Triple(title, artist, album)
         pendingArtwork = artworkJpeg
-        if (!streamReady) return
-        sendMetadataNow()
+        metadataDirty.set(true)
     }
 
-    private fun sendMetadataNow() {
-        val meta = pendingMetadata ?: return
-        try {
+    /**
+     * Streaming-thread only: transmit queued metadata + artwork.
+     * Returns false when an exchange failed at the transport level.
+     */
+    private fun flushMetadataNow(): Boolean {
+        val meta = pendingMetadata ?: return true
+        val art = pendingArtwork
+        metadataDirty.set(false)
+        return try {
             val body = Dmap.metadataBody(meta.first, meta.second, meta.third)
             if (body.isNotEmpty()) {
                 val resp = rtsp(
@@ -120,13 +163,14 @@ class Ap2AudioSession(
                 LogBus.log(
                     "[$TAG] SET_PARAMETER metadata '${meta.first}' -> ${resp.status}")
             }
-            val art = pendingArtwork
             if (art != null && art.isNotEmpty()) {
                 val resp = rtsp("SET_PARAMETER", rtspUri, art, "image/jpeg")
                 LogBus.log("[$TAG] SET_PARAMETER artwork (${art.size}B) -> ${resp.status}")
             }
+            true
         } catch (e: Exception) {
             LogBus.log("[$TAG] SET_PARAMETER metadata failed: ${e.message}")
+            false
         }
     }
     data class RtspResp(val status: Int, val headers: Map<String, String>, val body: ByteArray)
@@ -417,7 +461,6 @@ class Ap2AudioSession(
 
             // -- step 7: timing responder + streaming --------------------
             val ssrc = Random.nextInt().toLong() and 0xFFFFFFFFL
-            val startNtp = Ap2AudioPackets.ntpNow()
             // RTP timestamps are small 32-bit values (reference: latency +
             // framesSent; owntone: 88200 + pos), NOT NTP-derived. The huge
             // NTP value truncated to 32 bits is garbage the HomePod can't
@@ -426,13 +469,17 @@ class Ap2AudioSession(
             LogBus.log("[$TAG] audio step 6: streaming live PCM (ssrc=$ssrc ts0=$startTs)")
             streamAudio(
                 audioSock, controlSock, timingSock,
-                dataPort, serverControlPort, ssrc, startNtp, startTs,
+                dataPort, serverControlPort, ssrc, startTs,
             )
 
             // -- step 8: TEARDOWN -----------------------------------------
             LogBus.log("[$TAG] audio step 7: TEARDOWN")
-            val td = rtsp("TEARDOWN", rtspUri, ByteArray(0), null)
-            LogBus.log("[$TAG] TEARDOWN -> ${td.status}")
+            try {
+                val td = rtsp("TEARDOWN", rtspUri, ByteArray(0), null)
+                LogBus.log("[$TAG] TEARDOWN -> ${td.status}")
+            } catch (e: Exception) {
+                LogBus.log("[$TAG] TEARDOWN failed (session already gone?): ${e.message}")
+            }
             LogBus.log("[$TAG] AP2 session ended — audio streamed to HomePod")
         } finally {
             eventRunning.set(false)
@@ -463,8 +510,14 @@ class Ap2AudioSession(
             val inp = sock.getInputStream()
             val out = sock.getOutputStream()
             while (running.get()) {
-                val n = try { inp.read(tmp) } catch (_: Exception) { -1 }
-                if (n == null || n < 0) break
+                // The socket has a 500 ms read timeout so the loop can
+                // notice teardown. A timeout is NOT end-of-stream: the
+                // pre-1.2.2 code treated it as EOF, so this responder
+                // died ~0.5 s into every session and every later event
+                // the receiver pushed went unanswered.
+                val n = try { inp.read(tmp) } catch (_: java.net.SocketTimeoutException) { 0 }
+                    catch (_: Exception) { -1 }
+                if (n < 0) break
                 if (n == 0) continue
                 encBuf.write(tmp, 0, n)
                 // Frame-parse: [2B LE len][cipher][16B tag], AAD = len bytes.
@@ -545,7 +598,6 @@ class Ap2AudioSession(
         dataPort: Int,
         serverControlPort: Int,
         ssrc: Long,
-        startNtp: ULong,
         startTs: ULong,
     ) {
         val serverAddr = InetSocketAddress(host, dataPort)
@@ -562,7 +614,11 @@ class Ap2AudioSession(
             // 0x80 0xD6 + original seq (pyatv/owntone parity). Every packet is
             // counted/logged: silence here is diagnostic too.
             controlSock.soTimeout = 5
-            val backlog = mutableMapOf<Int, ByteArray>()
+            // Insertion-ordered so eviction drops the OLDEST packet even
+            // after the 16-bit sequence number wraps (a min-key eviction
+            // throws away fresh packets post-wrap). 1024 deep = ~8.2 s of
+            // audio (pyatv's backlog is 1000).
+            val backlog = LinkedHashMap<Int, ByteArray>()
             fun drainRetransmits() {
                 val buf = ByteArray(512)
                 while (true) {
@@ -601,7 +657,20 @@ class Ap2AudioSession(
             // control service parity): sync sent from the audio socket comes
             // from an unknown source port and the receiver ignores it, so
             // playout is never scheduled -> total silence.
-            val sync0 = Ap2AudioPackets.syncPacket(true, startTs.toLong(), Ap2AudioPackets.LATENCY.toLong(), startNtp)
+            // Session timeline epoch: RTP timestamp startTs is bound to
+            // this one wall-clock instant for the WHOLE session. Every
+            // sync packet derives its NTP field from the RTP timestamp
+            // through this fixed mapping (pyatv/owntone parity — see
+            // Ap2AudioPackets.syncNtp). The pre-1.2.2 code paired the
+            // stream head with a fresh ntpNow() each second while the
+            // pacing loop let source stalls push the data timeline
+            // behind the wall clock; the receiver's playout lead eroded
+            // until it closed the control channel at ~36 s.
+            val epochNtp = Ap2AudioPackets.ntpNow()
+            fun syncNtpFor(rtpTs: ULong): ULong =
+                Ap2AudioPackets.syncNtp(epochNtp, startTs, rtpTs)
+
+            val sync0 = Ap2AudioPackets.syncPacket(true, startTs.toLong(), Ap2AudioPackets.LATENCY.toLong(), syncNtpFor(startTs))
             run {
                 val hex = sync0.joinToString("") { "%02x".format(it) }
                 LogBus.log("[$TAG] DIAG sync0 hex20=$hex")
@@ -611,68 +680,85 @@ class Ap2AudioSession(
 
             // Volume via SET_PARAMETER text/parameters (AP1+AP2 parity);
             // uses the level set through setVolumeDb (default 0 dB = max).
+            // Capture + clear the dirty flag BEFORE sending so a change
+            // landing mid-send is not lost (it flushes in the loop).
             streamReady = true
+            val initialDb = volumeDb
+            volumeDirty.set(false)
             val vol = rtsp("SET_PARAMETER", rtspUri,
-                "volume: ${"%.6f".format(java.util.Locale.US, volumeDb)}"
+                "volume: ${"%.6f".format(java.util.Locale.US, initialDb)}"
                     .toByteArray(Charsets.US_ASCII), "text/parameters")
             LogBus.log("[$TAG] SET_PARAMETER volume -> ${vol.status}")
-            if (pendingMetadata != null) sendMetadataNow()
+            if (pendingMetadata != null) flushMetadataNow()
 
             var lastSyncMs = System.currentTimeMillis()
             var lastFeedbackMs = 0L
+            var lastControlFlushMs = 0L
+            var controlFailures = 0
             var seq = 1
             // Nonce = RTP seqnum (owntone parity: "Using seqnum as nonce").
             // The receiver derives the ChaCha nonce from the packet's sequence
             // number; a separate counter desyncs decryption -> silence.
-            var framesSent = 0
+            var framesSent = 0L
+            var silenceSent = 0L
             val t0 = System.nanoTime()
-            var waitedNs = 0L
             var pending: ShortArray? = null
+            val silenceChunk = ShortArray(352 * 2)
             onStreaming()
             while (!stopRequested) {
                 if (pending == null) {
                     if (pcm.finished) break
-                    val w0 = System.nanoTime()
                     pending = pcm.nextInterleaved()
-                    if (pending == null) {
-                        if (pcm.finished) break
-                        Thread.sleep(5)
-                        waitedNs += System.nanoTime() - w0
-                    }
+                    if (pending == null && pcm.finished) break
                 }
-                val target = ((System.nanoTime() - t0 - waitedNs) * 44100.0 / 1e9).toLong()
-                // Token bucket: never more than ~8 packets ahead of wall clock.
+                // Pace strictly off the wall clock from t0 — the RTP
+                // timeline NEVER waits for the source. When the source
+                // starves, silence fills the gap so the head timestamp
+                // keeps tracking the epoch (pyatv sends padding packets
+                // the same way). The pre-1.2.2 loop subtracted source
+                // wait time from the pacing clock, permanently shifting
+                // the timeline behind the wall clock on every hiccup.
+                val due = Ap2AudioPackets.framesDue(System.nanoTime() - t0)
                 var sentThisTick = 0
-                while (pending != null && framesSent + 352 <= target &&
-                    sentThisTick < 8 && !stopRequested
-                ) {
-                    val chunk = pending!!
+                while (framesSent + 352 <= due && sentThisTick < 16 && !stopRequested) {
+                    val chunk: ShortArray
+                    if (pending != null) {
+                        chunk = pending!!
+                        pending = null
+                    } else if (pcm.finished) {
+                        break
+                    } else {
+                        chunk = silenceChunk
+                        silenceSent++
+                    }
                     val ts = startTs + framesSent.toULong()
-                    val hdr = Ap2AudioPackets.rtpHeader(seq, ts.toLong(), ssrc, framesSent == 0)
+                    val hdr = Ap2AudioPackets.rtpHeader(seq, ts.toLong(), ssrc, framesSent == 0L)
                     val payload = AlacFrame.buildUncompressed(chunk)
                     val wire = Ap2AudioPackets.encryptAudioPayload(audioKey, seq.toLong(), hdr, payload)
                     val pkt = hdr + wire
                     // DIAG: dump first 2 RTP packets for byte-level comparison
-                    if (framesSent == 0 || framesSent == 352) {
+                    if (framesSent == 0L || framesSent == 352L) {
                         val hex = pkt.take(48).joinToString("") { "%02x".format(it) }
                         LogBus.log("[$TAG] DIAG rtp#${framesSent / 352} seq=$seq ts=$ts ssrc=$ssrc len=${pkt.size} hex48=$hex")
                         val payHex = payload.take(16).joinToString("") { "%02x".format(it) }
                         LogBus.log("[$TAG] DIAG alac payload16=$payHex")
                     }
                     backlog[seq] = pkt
-                    if (backlog.size > 512) backlog.remove(backlog.keys.minOrNull())
+                    if (backlog.size > 1024) backlog.remove(backlog.keys.first())
                     audioSock.send(DatagramPacket(pkt, pkt.size, serverAddr))
                     framesSent += 352
                     seq = (seq + 1) and 0xFFFF
                     sentThisTick++
-                    pending = if (pcm.finished) null else pcm.nextInterleaved()
+                    if (pending == null && !pcm.finished) {
+                        pending = pcm.nextInterleaved()
+                    }
                 }
                 val nowMs = System.currentTimeMillis()
                 if (nowMs - lastSyncMs >= 1000) {
                     lastSyncMs = nowMs
                     val rtpTs = startTs + framesSent.toULong()
                     val sp = Ap2AudioPackets.syncPacket(
-                        false, rtpTs.toLong(), Ap2AudioPackets.LATENCY.toLong(), Ap2AudioPackets.ntpNow())
+                        false, rtpTs.toLong(), Ap2AudioPackets.LATENCY.toLong(), syncNtpFor(rtpTs))
                     controlSock.send(DatagramPacket(sp, sp.size, serverControlAddr))
                 }
                 if (nowMs - lastFeedbackMs >= 2000) {
@@ -680,21 +766,56 @@ class Ap2AudioSession(
                     try {
                         val fb = rtsp("POST", "/feedback", ByteArray(0), null)
                         LogBus.log("[$TAG] POST /feedback -> ${fb.status}")
+                        controlFailures = 0
                     } catch (e: Exception) {
                         LogBus.log("[$TAG] POST /feedback failed: ${e.message}")
+                        controlFailures++
                     }
+                }
+                // Queued volume/metadata changes are flushed HERE, on the
+                // streaming thread — since 1.2.1 the control channel has a
+                // single owner, so requests can never cross, queue up
+                // behind a foreign thread's round trip, or desync the
+                // HAP framing via another thread's timed-out read.
+                if (nowMs - lastControlFlushMs >= 200) {
+                    lastControlFlushMs = nowMs
+                    var exchanged = false
+                    var ok = true
+                    if (volumeDirty.get()) {
+                        exchanged = true
+                        if (!flushVolumeNow()) ok = false
+                    }
+                    if (metadataDirty.get()) {
+                        exchanged = true
+                        if (!flushMetadataNow()) ok = false
+                    }
+                    if (exchanged) {
+                        if (ok) controlFailures = 0 else controlFailures++
+                    }
+                }
+                if (controlFailures >= 3) {
+                    // A control channel that keeps failing at the
+                    // transport level is desynced beyond recovery (HAP
+                    // framing has no resync). End the session honestly
+                    // instead of zombie-streaming audio the receiver is
+                    // about to drop anyway when /feedback stops landing.
+                    LogBus.log(
+                        "[$TAG] control channel failed $controlFailures times " +
+                            "in a row — ending session")
+                    break
                 }
                 drainRetransmits()
                 Thread.sleep(2)
             }
             // Drain tail: let the last packets arrive before TEARDOWN.
             Thread.sleep(1500)
-            LogBus.log("[$TAG] streamed $framesSent frames (${framesSent / 352} packets)")
+            LogBus.log("[$TAG] streamed $framesSent frames (${framesSent / 352} packets, $silenceSent silence)")
             LogBus.log(
                 "[$TAG] counters: timingRequests=${timingAnswered.get()} " +
                     "controlPackets=${controlPacketsSeen.get()} " +
                     "retransmits=${retransmitsServed.get()} " +
-                    "eventsAnswered=${eventsAnswered.get()}")
+                    "eventsAnswered=${eventsAnswered.get()} " +
+                    "silencePackets=$silenceSent")
         }
     }
 }
