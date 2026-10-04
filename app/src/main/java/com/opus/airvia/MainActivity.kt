@@ -109,6 +109,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        PhoneSilencer.healIfStale(this)
         Prefs.loadEq(this)
         eqGains = Prefs.eqGains(this)
         eqPreamp = Prefs.eqPreamp(this)
