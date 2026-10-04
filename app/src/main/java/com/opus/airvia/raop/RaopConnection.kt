@@ -57,6 +57,16 @@ class RaopConnection(
     internal var rtsp: Socket? = null
     private var rtspReader: BufferedReader? = null
     private val rtspLock = Any()
+
+    // Queued control changes (volume / metadata). The setters used to
+    // run a synchronous RTSP exchange on the caller's (main) thread —
+    // the same defect fixed in Ap2AudioSession 1.2.1. They now only
+    // record the latest value; the heartbeat thread (this connection's
+    // periodic RTSP owner) flushes them within ~250 ms.
+    private val pendingVolumePct =
+        java.util.concurrent.atomic.AtomicInteger(-1)
+    private val pendingMetadata =
+        java.util.concurrent.atomic.AtomicReference<Triple<String, String, String>?>(null)
     private var cseq = 0
     private val sessionId = Random.nextInt(1, Int.MAX_VALUE)
     // Sender identity headers every classic RAOP sender (iTunes, lox-airplay-sender,
@@ -89,6 +99,13 @@ class RaopConnection(
     private val ssrc = Random.nextInt()
     private var seq = Random.nextInt(0, 65536)
     private var rtpTime = Random.nextInt()
+
+    // Fixed sync epoch (see Ap2AudioPackets.syncNtp): the NTP paired
+    // with rtpTime at RECORD. Sync packets derive their NTP from the
+    // RTP timestamp through this anchor — never a fresh wall-clock
+    // sample, which would rewrite the receiver's clock every second.
+    @Volatile private var syncEpochNtp = 0L
+    @Volatile private var syncEpochTs = 0
 
     private val running = AtomicBoolean(false)
     private val streaming = AtomicBoolean(false)
@@ -330,6 +347,11 @@ class RaopConnection(
         )
         check(resp.status == 200) { "RECORD failed: ${resp.status}" }
 
+        // Anchor the sync epoch: this rtpTime maps to this wall clock
+        // for the rest of the session.
+        syncEpochTs = rtpTime
+        syncEpochNtp = ntpNow()
+
         running.set(true)
         heartbeatThread = thread("raop-heartbeat") { heartbeatLoop() }
         timingThread = thread("raop-timing") { timingLoop() }
@@ -454,14 +476,18 @@ class RaopConnection(
                 val now = System.currentTimeMillis()
                 if (now - lastSync >= 1000) {
                     lastSync = now
-                    // Sync packet: RTP<->NTP mapping, every second.
+                    // Sync packet: RTP<->NTP mapping, every second. The
+                    // NTP comes from the fixed session epoch (anchored
+                    // at RECORD), not a fresh ntpNow() — see field docs.
                     val p = ByteArray(20)
                     p[0] = 0x80.toByte()
                     p[1] = 0xD6.toByte()
                     p[2] = 0x00
                     p[3] = 0x07
                     writeU32(p, 4, rtpTime)
-                    writeU64(p, 8, ntpNow())
+                    val syncNtp = syncEpochNtp +
+                        ((rtpTime - syncEpochTs).toLong() shl 32) / 44100L
+                    writeU64(p, 8, syncNtp)
                     writeU32(p, 16, rtpTime)
                     try {
                         sock.send(DatagramPacket(p, p.size, addr, timingPort))
@@ -546,17 +572,24 @@ class RaopConnection(
     }
 
     private fun heartbeatLoop() {
+        var lastOptionsMs = System.currentTimeMillis()
         try {
             while (running.get()) {
-                Thread.sleep(15_000)
+                Thread.sleep(250)
                 if (!running.get()) break
-                try {
-                    // HomePods drop the session without a periodic OPTIONS.
-                    // rtspExchange attaches the real Session id automatically.
-                    val resp = rtspExchange("OPTIONS", sessionUri())
-                    if (resp.status != 200) break
-                } catch (_: Exception) {
-                    break
+                // Queued volume/metadata changes flush here, on this
+                // thread, within ~250 ms (see pendingVolumePct docs).
+                flushPendingControls()
+                if (System.currentTimeMillis() - lastOptionsMs >= 15_000) {
+                    lastOptionsMs = System.currentTimeMillis()
+                    try {
+                        // HomePods drop the session without a periodic OPTIONS.
+                        // rtspExchange attaches the real Session id automatically.
+                        val resp = rtspExchange("OPTIONS", sessionUri())
+                        if (resp.status != 200) break
+                    } catch (_: Exception) {
+                        break
+                    }
                 }
             }
         } catch (_: InterruptedException) {
@@ -599,16 +632,24 @@ class RaopConnection(
 
     /**
      * Set device volume. [percent] 0..100 maps to RAOP's -30 dB..0 dB
-     * (0 dB = full volume, -144 dB = mute).
+     * (0 dB = full volume, -144 dB = mute). Non-blocking: the value is
+     * recorded and flushed by the heartbeat thread (see field docs).
      */
     fun setVolume(percent: Int) {
         if (!running.get()) return
-        val p = percent.coerceIn(0, 100)
-        val db = -30.0 + (p / 100.0) * 30.0
+        pendingVolumePct.set(percent.coerceIn(0, 100))
+    }
+
+    /** Heartbeat-thread only: transmit a queued volume change. */
+    private fun sendVolumeNow(percent: Int) {
+        val db = -30.0 + (percent / 100.0) * 30.0
         try {
             rtspExchange(
                 "SET_PARAMETER", sessionUri(),
-                body = "volume: %.6f".format(db),
+                // Locale.US pinned: the default-locale format used
+                // before could render "-15,000000" on comma-decimal
+                // locales — a malformed parameter body.
+                body = "volume: %.6f".format(java.util.Locale.US, db),
                 contentType = "text/parameters",
             )
         } catch (_: Exception) {
@@ -619,10 +660,16 @@ class RaopConnection(
      * Push now-playing text metadata (DMAP). Fields are capped under
      * 128 UTF-8 bytes by [com.opus.airvia.Dmap], so the body survives
      * this connection's UTF-8 String request path byte-exactly.
-     * Artwork is not sent on the classic path.
+     * Artwork is not sent on the classic path. Non-blocking: recorded
+     * here, flushed by the heartbeat thread like volume.
      */
     fun setMetadata(title: String, artist: String, album: String) {
         if (!running.get()) return
+        pendingMetadata.set(Triple(title, artist, album))
+    }
+
+    /** Heartbeat-thread only: transmit queued metadata. */
+    private fun sendMetadataNow(title: String, artist: String, album: String) {
         val body = com.opus.airvia.Dmap.metadataBody(title, artist, album)
         if (body.isEmpty()) return
         try {
@@ -633,6 +680,14 @@ class RaopConnection(
             )
         } catch (_: Exception) {
         }
+    }
+
+    /** Heartbeat-thread only: flush queued volume, then metadata. */
+    private fun flushPendingControls() {
+        val v = pendingVolumePct.getAndSet(-1)
+        if (v >= 0) sendVolumeNow(v)
+        val m = pendingMetadata.getAndSet(null)
+        if (m != null) sendMetadataNow(m.first, m.second, m.third)
     }
 
     fun teardown() {
