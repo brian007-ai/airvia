@@ -243,6 +243,39 @@ fun main() {
         val diff = if (ntp > back) ntp - back else back - ntp
         check("P6 ntp round-trip", diff < 200000UL)
     }
+    run {
+        // 1.2.2 sync-epoch mapping + pacing math (ported with the
+        // Outro 1.3.4 fix). The receiver locks its playout clock to
+        // this mapping; it must be a pure function of the RTP
+        // timestamp under ONE fixed epoch (pyatv/owntone parity).
+        val epoch = (0x83AA7E80UL shl 32)
+        val epochTs = 66150UL
+        check("P7 syncNtp at epoch == epoch",
+            Ap2AudioPackets.syncNtp(epoch, epochTs, epochTs) == epoch)
+        check("P8 syncNtp +44100 frames == epoch + 2^32",
+            Ap2AudioPackets.syncNtp(epoch, epochTs, epochTs + 44100UL) == epoch + (1UL shl 32))
+        check("P9 syncNtp +352 frames",
+            Ap2AudioPackets.syncNtp(epoch, epochTs, epochTs + 352UL) ==
+                epoch + ((352UL shl 32) / 44100UL))
+        val mono = (0..10).all { i ->
+            Ap2AudioPackets.syncNtp(epoch, epochTs, epochTs + (i * 4410).toULong()) >=
+                Ap2AudioPackets.syncNtp(epoch, epochTs, epochTs + ((i - 1).coerceAtLeast(0) * 4410).toULong())
+        }
+        check("P10 syncNtp monotonic in rtpTs", mono)
+        val sp = Ap2AudioPackets.syncPacket(
+            false, 66150L + 44100L, 66150L,
+            Ap2AudioPackets.syncNtp(epoch, epochTs, epochTs + 44100UL))
+        check("P11 sync packet carries epoch-derived NTP",
+            sp.size == 20 && sp[8] == 0x83.toByte() && sp[9] == 0xAA.toByte() &&
+                sp[10] == 0x7E.toByte() && sp[11] == 0x81.toByte() &&
+                sp[12] == 0.toByte() && sp[15] == 0.toByte() &&
+                sp[18] == 0xAE.toByte() && sp[19] == 0xAA.toByte())
+        check("P12 framesDue(0) == 0", Ap2AudioPackets.framesDue(0L) == 0L)
+        check("P13 framesDue(1s) == 44100", Ap2AudioPackets.framesDue(1_000_000_000L) == 44100L)
+        check("P14 framesDue(negative) == 0", Ap2AudioPackets.framesDue(-5L) == 0L)
+        check("P15 framesDue(8ms) == 352 (one packet)", Ap2AudioPackets.framesDue(8_000_000L) == 352L)
+        check("P16 framesDue(60s) == 2646000", Ap2AudioPackets.framesDue(60_000_000_000L) == 2_646_000L)
+    }
 
     if (failures == 0) println("ALL AP2 CHECKS PASSED")
     else println("$failures AP2 CHECK(S) FAILED")
