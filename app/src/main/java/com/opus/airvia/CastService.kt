@@ -115,6 +115,8 @@ class CastService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // Heal a phone volume a previous (killed) run left zeroed.
+        PhoneSilencer.healIfStale(this)
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "Casting", NotificationManager.IMPORTANCE_LOW),
@@ -207,6 +209,10 @@ class CastService : Service() {
             shutdown()
         }
         VolumeKeys.setCasting(true)
+
+        // Silence the phone itself while casting (capture is pre-fader,
+        // so the speaker keeps full level). Released in teardownCast.
+        PhoneSilencer.engage(this)
 
         CastEngine.volumeSaver = { sp, pct -> Prefs.saveVolume(this, sp, pct) }
         CastEngine.volumeLoader = { sp -> Prefs.volumeFor(this, sp) }
@@ -324,6 +330,7 @@ class CastService : Service() {
         } catch (_: Exception) {
         }
         projection = null
+        PhoneSilencer.release(this)
         VolumeKeys.stopHandler = null
         VolumeKeys.setCasting(false)
     }
