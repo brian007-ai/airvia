@@ -74,4 +74,20 @@ object Prefs {
     fun saveCapturePackages(ctx: Context, packages: Set<String>) {
         prefs(ctx).edit().putStringSet("capture_packages", packages).apply()
     }
+
+    // --- Phone silencer (stream volume saved before zeroing) -------------
+
+    /** STREAM_MUSIC index saved by [PhoneSilencer] before it zeroed it. */
+    fun silencerSaved(ctx: Context): Int? {
+        val p = prefs(ctx)
+        return if (p.contains("silencer_saved")) p.getInt("silencer_saved", 0) else null
+    }
+
+    fun setSilencerSaved(ctx: Context, index: Int) {
+        prefs(ctx).edit().putInt("silencer_saved", index).apply()
+    }
+
+    fun clearSilencerSaved(ctx: Context) {
+        prefs(ctx).edit().remove("silencer_saved").apply()
+    }
 }
