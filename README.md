@@ -84,6 +84,30 @@ resampler live in `tests/` and run on any JVM.
 Protocol behaviour was cross-checked against the open-source references
 [pyatv](https://pyatv.dev) and [owntone](https://owntone.github.io/owntone-server/).
 
+## Contributing — developers welcome!
+
+**Airvia is a public project, and developers are warmly welcome to join in
+and make it better.** This app exists because people share what they figure
+out — the AirPlay 2 sender here stands on the shoulders of open-source
+references like pyatv and owntone.
+
+Whether it's a bug fix, a new receiver protocol, better device
+compatibility, UI polish, or just a good idea:
+
+- Open an **issue** — bug reports (with your speaker model and a log from
+  the app's Log tab) genuinely help, and feature ideas are welcome.
+- Send a **pull request** — small or large, it will be reviewed with
+  thanks. If you're planning something big, open an issue first so we can
+  point you at the right part of the codebase.
+- Help **test** on hardware you own — every speaker brand behaves a
+  little differently, and reports from real devices keep the support list
+  honest.
+
+Fork it, build on it, ship improvements back — that's how a small free
+project like this stays alive and keeps getting better for everyone.
+No ads, no paywall, no account — just open source, kept open by the
+people who use it and build it.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
