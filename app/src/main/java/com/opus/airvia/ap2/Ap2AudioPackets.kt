@@ -33,6 +33,33 @@ object Ap2AudioPackets {
         return (sec shl 32) or ((frac shl 32) / rate.toULong())
     }
 
+    /**
+     * The session sync mapping: NTP time for RTP timestamp [rtpTs] under
+     * the FIXED epoch captured at stream start ([epochNtp] is the wall
+     * clock bound to RTP timestamp [epochTs]).
+     *
+     * This is the mapping every known-good sender uses (pyatv
+     * ControlClient._sync_task derives the sync NTP from the head RTP
+     * timestamp through the StreamContext epoch; owntone
+     * sync_packet_ntp_make does the same). Pairing the head timestamp
+     * with a FRESH wall-clock sample instead — the pre-1.2.2 behaviour —
+     * tells the receiver its playout anchor is "now" while the data
+     * timeline lags behind by every source stall the sender absorbed,
+     * so the receiver's lead erodes until it gives up and closes the
+     * session (~32 s in the Oppo/HomePod logs of 2026-10-03).
+     */
+    fun syncNtp(epochNtp: ULong, epochTs: ULong, rtpTs: ULong): ULong =
+        epochNtp + ts2ntp(rtpTs - epochTs, SAMPLE_RATE)
+
+    /**
+     * Frames that must have been sent [elapsedNs] after stream start to
+     * hold the RTP timeline on the wall clock. The sender paces against
+     * this and pads SILENCE when the PCM source starves, so the timeline
+     * never stalls (pyatv sends padding packets the same way).
+     */
+    fun framesDue(elapsedNs: Long): Long =
+        if (elapsedNs <= 0L) 0L else elapsedNs * SAMPLE_RATE / 1_000_000_000L
+
     private fun putBe16(out: ByteArray, off: Int, v: Int) {
         out[off] = (v ushr 8).toByte()
         out[off + 1] = v.toByte()
